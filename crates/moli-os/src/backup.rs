@@ -1,5 +1,5 @@
-//! `moli-os backup <dir>` and `moli-os restore <dir>`: everything Moli knows
-//! about the house, in one folder.
+//! `moli-os backup <dir>` and `moli-os restore <dir>`: the house's persistent
+//! configuration and history, in one folder (inventory: docs/components/exploitation.md).
 //!
 //! - SQLite databases are copied with `VACUUM INTO`: a consistent snapshot,
 //!   safe while Moli runs (WAL), compact, a standalone file.
@@ -18,9 +18,12 @@ use anyhow::{Context as _, bail};
 
 /// SQLite databases: copied through SQLite itself.
 const DATABASES: [&str; 2] = ["history.db", "energy.db"];
-/// Everything else worth keeping (missing ones are skipped).
-const FILES: [&str; 15] = [
+/// Persistent files; missing ones are skipped. Keep the documented inventory in sync.
+const FILES: [&str; 18] = [
     "moli.toml",
+    "settings.json",
+    "people.json",
+    "assistant.json",
     "plan.json",
     "phones.json",
     "secrets.enc",
@@ -170,6 +173,166 @@ fn known_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn household_files() -> [(&'static str, serde_json::Value); 3] {
+        use serde_json::json;
+
+        [
+            (
+                "people.json",
+                json!({
+                    "people": [
+                        {"id": "owner", "name": "Owner", "role": "owner",
+                         "emails": ["user@example.com"]},
+                        {"id": "guest", "name": "Guest", "role": "guest",
+                         "rooms": ["Salon"], "expires": 4_102_444_800_000_u64}
+                    ],
+                    "zones": [{"id": "maison", "name": "Maison", "latitude": 0.0,
+                               "longitude": 0.0, "radius": 100.0}],
+                    "invites": [{"code_hmac": "00".repeat(32), "person": "guest",
+                                 "expires": 4_102_444_800_000_u64}]
+                }),
+            ),
+            ("settings.json", json!({"language": "en"})),
+            (
+                "assistant.json",
+                json!({"voice": "nova", "style": "doux", "pace": "rapide"}),
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn a_backup_preserves_people_and_preferences() {
+        let base = std::env::temp_dir().join(format!("moli-backup-people-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (data, saved, fresh) = (base.join("data"), base.join("saved"), base.join("fresh"));
+        std::fs::create_dir_all(&data).unwrap();
+        for (name, value) in household_files() {
+            std::fs::write(data.join(name), serde_json::to_vec(&value).unwrap()).unwrap();
+        }
+        // This marker is deliberately not a key: no key generation or real secrets here.
+        std::fs::write(data.join("master.key"), b"excluded marker").unwrap();
+
+        backup(&data, &saved).unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(saved.join("manifest.json")).unwrap()).unwrap();
+        for (name, _) in household_files() {
+            assert_eq!(
+                manifest["files"][name].as_u64(),
+                Some(std::fs::metadata(data.join(name)).unwrap().len()),
+                "{name} must be included in the manifest"
+            );
+        }
+        assert!(manifest["files"].get("master.key").is_none());
+        assert!(!saved.join("master.key").exists());
+
+        restore(&fresh, &saved, false).unwrap();
+        for (name, _) in household_files() {
+            assert_eq!(
+                std::fs::read(fresh.join(name)).unwrap(),
+                std::fs::read(data.join(name)).unwrap(),
+                "{name} must survive a restore unchanged"
+            );
+            let occupied = base.join(format!("occupied-{name}"));
+            std::fs::create_dir_all(&occupied).unwrap();
+            std::fs::write(occupied.join(name), b"existing settings").unwrap();
+            assert!(restore(&occupied, &saved, false).is_err());
+            assert_eq!(std::fs::read_dir(&occupied).unwrap().count(), 1);
+            assert_eq!(
+                std::fs::read(occupied.join(name)).unwrap(),
+                b"existing settings"
+            );
+            restore(&occupied, &saved, true).unwrap();
+            assert_eq!(
+                std::fs::read(occupied.join(name)).unwrap(),
+                std::fs::read(data.join(name)).unwrap()
+            );
+        }
+        assert!(!fresh.join("master.key").exists());
+        assert_eq!(
+            std::fs::read(data.join("master.key")).unwrap(),
+            b"excluded marker"
+        );
+        assert_reloaded_household(&fresh).await;
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    /// Open the restored files through the same readers as startup, without any drivers.
+    async fn assert_reloaded_household(data: &Path) {
+        use moli_runtime::{Hub, HubOptions};
+        use tokio_util::sync::CancellationToken;
+
+        assert_eq!(moli_api::settings::language(data).as_deref(), Some("en"));
+        let hub = Hub::new(HubOptions::default()).unwrap();
+        let assistant = moli_assistant::Assistant::new(
+            hub.clone(),
+            None,
+            None,
+            None,
+            moli_assistant::Config::default(),
+        )
+        .unwrap();
+        assistant.load_voice_prefs(data.join("assistant.json"));
+        let settings = assistant.settings();
+        for key in ["voice", "style", "pace"] {
+            assert_eq!(settings[key], household_files()[2].1[key]);
+        }
+
+        let options = moli_api::Options {
+            household: Some(moli_api::Household::open(&hub, Some(data), &[])),
+            ..Default::default()
+        };
+        let app = moli_api::router(hub, CancellationToken::new(), &options)
+            .into_make_service_with_connect_info::<std::net::SocketAddr>();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let request = moli_net::empty(
+            http::Request::get("/api/people").header(http::header::HOST, addr.to_string()),
+        )
+        .unwrap();
+        let (status, body) = moli_net::plain("127.0.0.1", addr.port(), request)
+            .await
+            .unwrap();
+        server.abort();
+        assert_eq!(status, http::StatusCode::OK);
+        let loaded: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let expected = &household_files()[0].1;
+        assert_eq!(loaded["people"].as_array().unwrap().len(), 2);
+        for (i, person) in expected["people"].as_array().unwrap().iter().enumerate() {
+            for key in ["id", "name", "role"] {
+                assert_eq!(loaded["people"][i][key], person[key]);
+            }
+        }
+        assert_eq!(loaded["zones"], expected["zones"]);
+    }
+
+    #[test]
+    fn an_older_backup_without_household_files_still_restores() {
+        let base = std::env::temp_dir().join(format!("moli-backup-legacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (saved, fresh) = (base.join("saved"), base.join("fresh"));
+        std::fs::create_dir_all(&saved).unwrap();
+        std::fs::write(saved.join("labels.toml"), b"x = 1\n").unwrap();
+        std::fs::write(
+            saved.join("manifest.json"),
+            br#"{"moli_os":"0.1.0","taken_ms":0,"files":{"labels.toml":6}}"#,
+        )
+        .unwrap();
+        restore(&fresh, &saved, false).unwrap();
+        assert_eq!(
+            std::fs::read(fresh.join("labels.toml")).unwrap(),
+            b"x = 1\n"
+        );
+        for (name, _) in household_files() {
+            assert!(
+                !fresh.join(name).exists(),
+                "old backups cannot recreate {name}"
+            );
+        }
+        assert!(!fresh.join("master.key").exists());
+        std::fs::remove_dir_all(base).unwrap();
+    }
 
     #[test]
     fn a_backup_restores_into_an_empty_home() {
