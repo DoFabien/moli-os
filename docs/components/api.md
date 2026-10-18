@@ -87,6 +87,26 @@ en ajoute est une inconnue, refusée, et sa clé reste son adresse réelle (il n
 s'en choisir une pour échapper au blocage du PIN). Exemple : `maison.example.org`, une
 application Access dont la politique n'admet que les e-mails du foyer.
 
+L'identité Access ne remplace pas l'autorisation locale : si son e-mail appartient à
+une personne dont l'accès a expiré, la requête est refusée (403), même avec un jeton
+Access encore valide ou un cookie de connexion à un autre compte. Une personne
+active conserve son rôle et, pour un invité, les restrictions de ses pièces.
+
+Supprimer une personne ou retirer l'un de ses e-mails conserve cette adresse dans
+`people.json` (`revoked_emails`) : elle reste refusée après redémarrage et n'est pas
+recréée automatiquement par `[server.access] owners`. Seule une attribution explicite
+de cette adresse à une personne la réautorise, avec les droits de cette personne.
+Une adresse jamais enregistrée conserve le comportement historique : Access peut
+l'admettre comme membre du foyer sans fiche personnelle. Les fichiers `people.json`
+antérieurs, sans `revoked_emails`, restent lisibles ; les adresses supprimées avant
+cette version ne peuvent pas être reconstituées et doivent être retirées de la politique
+Access si elles y sont encore admises. Les connexions SSE déjà ouvertes ont leur propre
+cycle de vie : ce contrôle est effectué au début de chaque nouvelle requête.
+
+Compatibilité : un retour vers une version antérieure doit aussi prévoir une migration
+du registre des personnes. Ces versions refusent les champs inconnus et ne savent pas
+lire `revoked_emails` ; retirer simplement ce champ ferait perdre les révocations.
+
 ### 1.3 Origine d'une action
 
 Chaque écriture porte une `Origin` (`crates/moli-core/src/event.rs`), décidée **par le

@@ -20,7 +20,7 @@
 //! - The e-mails of `[server.access] owners` become owners at the first start:
 //!   a house that had owners keeps them, nothing to do.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
@@ -130,6 +130,17 @@ pub(crate) struct Book {
     pub(crate) zones: Vec<Zone>,
     #[serde(default)]
     invites: Vec<Invite>,
+    /// Removed addresses must not return as unknown, trusted Access identities.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    revoked_emails: BTreeSet<String>,
+}
+
+/// Access proves an identity; the local register may still refuse it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AccessPerson {
+    Unknown,
+    Active(PersonRef),
+    Denied,
 }
 
 /// Who a request comes from, when it is a person.
@@ -414,7 +425,8 @@ fn active(p: &Person) -> bool {
 
 impl People {
     /// Reads `people.json` (none: nobody yet) and makes `owners` (Access
-    /// e-mails of `[server.access]`) owners if nobody has their e-mail.
+    /// e-mails of `[server.access]`) owners if nobody has their e-mail and it
+    /// has not been explicitly removed.
     pub(crate) fn open(hub: Hub, data_dir: Option<&Path>, owners: &[String]) -> Self {
         let path = data_dir.map(|d| d.join(FILE));
         let mut book: Book = path
@@ -431,7 +443,10 @@ impl People {
         let mut changed = false;
         for email in owners {
             let email = email.trim().to_lowercase();
-            if email.is_empty() || book.people.iter().any(|p| p.emails.contains(&email)) {
+            if email.is_empty()
+                || book.revoked_emails.contains(&email)
+                || book.people.iter().any(|p| p.emails.contains(&email))
+            {
                 continue;
             }
             let local = email.split('@').next().unwrap_or("proprietaire");
@@ -546,14 +561,22 @@ impl People {
             .map(Self::reference)
     }
 
-    /// The person Cloudflare Access vouched for, if Moli knows the e-mail.
-    pub(crate) fn by_email(&self, email: &str) -> Option<PersonRef> {
+    /// Unknown Access identities retain the household's legacy admission;
+    /// expired people and removed addresses must never fall back to it.
+    pub(crate) fn by_email(&self, email: &str) -> AccessPerson {
         let email = email.trim().to_lowercase();
-        lock(&self.book)
-            .people
-            .iter()
-            .find(|p| active(p) && p.emails.contains(&email))
-            .map(Self::reference)
+        let book = lock(&self.book);
+        if let Some(person) = book.people.iter().find(|p| p.emails.contains(&email)) {
+            if active(person) {
+                AccessPerson::Active(Self::reference(person))
+            } else {
+                AccessPerson::Denied
+            }
+        } else if book.revoked_emails.contains(&email) {
+            AccessPerson::Denied
+        } else {
+            AccessPerson::Unknown
+        }
     }
 
     /// The person signed in by this request's cookie.
@@ -793,6 +816,9 @@ impl People {
                 macs: draft.macs,
                 created: now_ms(),
             };
+            for email in &person.emails {
+                book.revoked_emails.remove(email);
+            }
             book.people.push(person.clone());
             Ok(person)
         })
@@ -817,6 +843,15 @@ impl People {
                     .ok_or(Refused::NotFound)?;
                 if p.role == Role::Owner && draft.role != Role::Owner && owners_left == 0 {
                     return Err(Refused::LastOwner);
+                }
+                book.revoked_emails.extend(
+                    p.emails
+                        .iter()
+                        .filter(|e| !draft.emails.contains(e))
+                        .cloned(),
+                );
+                for email in &draft.emails {
+                    book.revoked_emails.remove(email);
                 }
                 p.name = draft.name;
                 p.role = draft.role;
@@ -847,6 +882,7 @@ impl People {
             {
                 return Err(Refused::LastOwner);
             }
+            book.revoked_emails.extend(p.emails.iter().cloned());
             book.people.retain(|p| p.id != gone);
             book.invites.retain(|i| i.person != gone);
             Ok(())
@@ -1055,7 +1091,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let owners = vec!["Moi@Example.org".to_owned()];
         let p = People::open(hub(), Some(&dir), &owners);
-        let me = p.by_email("moi@example.org").unwrap();
+        let AccessPerson::Active(me) = p.by_email("moi@example.org") else {
+            panic!("configured owner must be active");
+        };
         assert_eq!((me.id.as_str(), me.role), ("moi", Role::Owner));
         drop(p);
         let p = People::open(hub(), Some(&dir), &owners);
@@ -1133,6 +1171,61 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn access_revocations_survive_restart_and_explicit_reassignment() {
+        let dir = folder("access-revoked");
+        let p = People::open(hub(), Some(&dir), &[]);
+        let mut guest = draft("Guest", Role::Guest);
+        guest.emails = vec!["Old@Example.com".into()];
+        p.create(guest.clone()).await.unwrap();
+        guest.emails = vec!["new@example.com".into()];
+        p.update("guest", guest.clone()).await.unwrap();
+        drop(p);
+        let p = People::open(hub(), Some(&dir), &[]);
+        assert_eq!(p.by_email(" OLD@example.com "), AccessPerson::Denied);
+        assert!(matches!(
+            p.by_email("new@example.com"),
+            AccessPerson::Active(_)
+        ));
+        p.remove("guest").await.unwrap();
+        drop(p);
+        let p = People::open(hub(), Some(&dir), &[]);
+        assert_eq!(p.by_email("old@example.com"), AccessPerson::Denied);
+        assert_eq!(p.by_email("new@example.com"), AccessPerson::Denied);
+        assert_eq!(p.by_email("unknown@example.com"), AccessPerson::Unknown);
+        // An explicit assignment restores only the new person's rights.
+        p.create(guest.clone()).await.unwrap();
+        guest.emails.push("old@example.com".into());
+        p.update("guest", guest).await.unwrap();
+        drop(p);
+        let p = People::open(hub(), Some(&dir), &[]);
+        for email in ["old@example.com", "new@example.com"] {
+            let AccessPerson::Active(person) = p.by_email(email) else {
+                panic!("explicitly reassigned address must be active");
+            };
+            assert_eq!(person.role, Role::Guest);
+        }
+        assert!(p.book().revoked_emails.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn configured_access_owners_do_not_return_after_removal() {
+        let dir = folder("access-owner-removed");
+        let owners = vec!["first@example.com".into(), "second@example.com".into()];
+        let p = People::open(hub(), Some(&dir), &owners);
+        p.remove("first").await.unwrap();
+        drop(p);
+        let p = People::open(hub(), Some(&dir), &owners);
+        assert_eq!(p.by_email("first@example.com"), AccessPerson::Denied);
+        assert!(matches!(
+            p.by_email("second@example.com"),
+            AccessPerson::Active(_)
+        ));
+        assert_eq!(p.book().people.len(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// A data folder of its own.

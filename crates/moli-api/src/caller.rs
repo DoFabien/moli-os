@@ -24,7 +24,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
 use crate::access::Verifier;
-use crate::people::{People, PersonRef};
+use crate::people::{AccessPerson, People, PersonRef};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Via {
@@ -298,7 +298,19 @@ pub(crate) async fn identify(
     // Who it is, when Moli knows: the person Access vouched for, else the
     // person signed in on this browser (from anywhere: a phone moves).
     if let Via::Access { email } = &caller.via {
-        caller.person = gate.people.by_email(email);
+        caller.person = match gate.people.by_email(email) {
+            AccessPerson::Active(person) => Some(person),
+            AccessPerson::Unknown => None,
+            AccessPerson::Denied => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    axum::Json(
+                        serde_json::json!({ "error": moli_i18n::tr!("serveur.acces.refuse") }),
+                    ),
+                )
+                    .into_response();
+            }
+        };
     }
     if caller.person.is_none()
         && let Some(person) = gate.people.signed_in(request.headers())

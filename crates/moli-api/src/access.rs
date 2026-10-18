@@ -306,8 +306,15 @@ pub(crate) fn b64url(s: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use crate::caller::{Caller, Gate, Via};
+    use crate::people::{Draft, People, Role};
+    use axum::http::StatusCode;
+    use moli_runtime::{Hub, HubOptions, MasterKey};
     use ring::rand::SystemRandom;
     use ring::signature::{RSA_PKCS1_SHA256, RsaKeyPair};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     const ISS: &str = "https://maison.cloudflareaccess.com";
     const AUD: &str = "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0";
@@ -360,6 +367,213 @@ mod tests {
     }
 
     const HEADER: &str = r#"{"alg":"RS256","kid":"k1","typ":"JWT"}"#;
+
+    /// A real signed assertion through the caller middleware, without fetching keys.
+    async fn access_request(
+        people: &Arc<People>,
+        email: &str,
+        path: &str,
+        cookie: Option<&str>,
+    ) -> (u16, String) {
+        let (pair, key) = signer();
+        let assertion = token(&pair, HEADER, &claims(AUD, ISS, now_s() + 3600, email));
+        let verifier = Verifier::new(&AccessConfig {
+            team: "maison".into(),
+            aud: AUD.into(),
+            owners: vec![],
+        });
+        *verifier.keys.write().unwrap() = Keys {
+            by_kid: HashMap::from([("k1".into(), key)]),
+            fetched: Some(Instant::now()),
+            tried: Some(Instant::now()),
+        };
+        let app = axum::Router::new()
+            .route("/api/journal", axum::routing::get(crate::rest::journal))
+            .route(
+                "/api/devices",
+                axum::routing::get(|caller: Caller| async move {
+                    axum::Json(serde_json::json!({
+                        "via": caller.via_name(), "person": caller.person,
+                    }))
+                }),
+            )
+            .with_state(Hub::new(HubOptions::default()).unwrap())
+            .layer(axum::middleware::from_fn_with_state(
+                Gate {
+                    access: Some(Arc::new(verifier)),
+                    demo: false,
+                    people: Arc::clone(people),
+                },
+                crate::caller::identify,
+            ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let cookie = cookie.map_or_else(String::new, |c| format!("Cookie: {c}\r\n"));
+        let request = format!(
+            "GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nCf-Ray: test\r\nCf-Access-Jwt-Assertion: {assertion}\r\n{cookie}\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        let result =
+            tokio::time::timeout(Duration::from_secs(5), stream.read_to_string(&mut response))
+                .await;
+        server.abort();
+        result.unwrap().unwrap();
+        (response[9..12].parse().unwrap(), response)
+    }
+
+    fn person(name: &str, role: Role, email: &str) -> Draft {
+        Draft {
+            name: name.into(),
+            role,
+            emails: vec![email.into()],
+            color: None,
+            rooms: vec!["Salon".into()],
+            expires: None,
+            macs: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn access_preserves_active_roles_and_unknown_household() {
+        let hub = Hub::new(HubOptions::default()).unwrap();
+        let people = Arc::new(People::open(hub, None, &["owner@example.com".into()]));
+        let mut guest = person("Guest", Role::Guest, "guest@example.com");
+        guest.expires = Some(moli_core::now_ms() + 3_600_000);
+        people.create(guest).await.unwrap();
+        people
+            .create(person("Member", Role::Member, "member@example.com"))
+            .await
+            .unwrap();
+        for (email, role) in [
+            ("guest@example.com", "guest"),
+            ("member@example.com", "member"),
+            ("owner@example.com", "owner"),
+        ] {
+            let (status, body) = access_request(&people, email, "/api/devices", None).await;
+            assert_eq!(status, 200, "{body}");
+            assert!(body.contains(&format!("\"role\":\"{role}\"")), "{body}");
+            if role == "guest" {
+                assert!(body.contains("\"rooms\":[\"Salon\"]"), "{body}");
+            }
+            let (status, _) = access_request(&people, email, "/api/journal", None).await;
+            assert_eq!(status, if role == "guest" { 403 } else { 200 });
+        }
+        let (status, body) =
+            access_request(&people, "unknown@example.com", "/api/devices", None).await;
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("\"person\":null"), "{body}");
+        assert!(body.contains("\"via\":\"access\""), "{body}");
+    }
+
+    #[tokio::test]
+    async fn access_refuses_expired_people_before_cookie_fallback() {
+        let dir = std::env::temp_dir().join(format!("moli-access-expired-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let hub = Hub::new(HubOptions {
+            secrets: Some((dir.join("secrets.enc"), MasterKey::generate().unwrap())),
+            ..HubOptions::default()
+        })
+        .unwrap();
+        let sessions = crate::session::Sessions::new(hub.clone(), None, &[]);
+        let people = Arc::new(People::open(hub, Some(&dir), &[]));
+        let mut guest = person("Guest", Role::Guest, "guest@example.com");
+        guest.expires = Some(1);
+        people.create(guest).await.unwrap();
+        people
+            .create(person("Member", Role::Member, "member@example.com"))
+            .await
+            .unwrap();
+        people
+            .set_password("member", "a test password only")
+            .await
+            .unwrap();
+        let caller = Caller {
+            via: Via::Outside,
+            key: "test".into(),
+            person: None,
+        };
+        let (session, _) = people
+            .login(&sessions, "member", "a test password only", &caller)
+            .await
+            .unwrap();
+        let cookie = People::cookie(&session);
+        for cookie in [None, Some(cookie.as_str())] {
+            for path in [
+                "/api/journal",
+                "/api/devices",
+                "/api/events",
+                "/mcp",
+                "/api/session",
+            ] {
+                let (status, body) =
+                    access_request(&people, "guest@example.com", path, cookie).await;
+                assert_eq!(status, StatusCode::FORBIDDEN.as_u16(), "{path}: {body}");
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn access_refuses_removed_addresses_until_explicitly_reassigned() {
+        let people = Arc::new(People::open(
+            Hub::new(HubOptions::default()).unwrap(),
+            None,
+            &[],
+        ));
+        people
+            .create(person("Guest", Role::Guest, "old@example.com"))
+            .await
+            .unwrap();
+        people
+            .update("guest", person("Guest", Role::Guest, "new@example.com"))
+            .await
+            .unwrap();
+        assert_eq!(
+            access_request(&people, "old@example.com", "/api/devices", None)
+                .await
+                .0,
+            403
+        );
+        assert_eq!(
+            access_request(&people, "new@example.com", "/api/devices", None)
+                .await
+                .0,
+            200
+        );
+        people.remove("guest").await.unwrap();
+        assert_eq!(
+            access_request(&people, "new@example.com", "/api/devices", None)
+                .await
+                .0,
+            403
+        );
+        people
+            .create(person("Guest", Role::Guest, "old@example.com"))
+            .await
+            .unwrap();
+        assert_eq!(
+            access_request(&people, "old@example.com", "/api/devices", None)
+                .await
+                .0,
+            200
+        );
+        assert_eq!(
+            access_request(&people, "old@example.com", "/api/journal", None)
+                .await
+                .0,
+            403
+        );
+    }
 
     #[test]
     fn a_genuine_assertion_names_its_person() {
